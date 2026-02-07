@@ -2,7 +2,7 @@
     "name": "spellchecker",
     "displayName": "SpellChecker",
     "description": "Offline spell checker",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "publisher": "swyphcosmo",
     "engines": {
         "vscode": "^1.46.0"
@@ -98,18 +98,18 @@
         "compile": "tsc -watch -p ./"
     },
     "devDependencies": {
-        "@types/mocha": "^2.2.32",
-        "@types/node": "^6.0.40",
-        "@types/vscode": "^1.46.0",
-        "vscode-test": "^1.4.0"
+        "@types/mocha": "^10.0.10",
+        "@types/node": "^25.2.1",
+        "@types/vscode": "^1.109.0",
+        "vscode-test": "^1.6.1"
     },
     "dependencies": {
         "fs": "0.0.1-security",
-        "jsonminify": "^0.4.1",
-        "mkdirp": "^0.5.1",
-        "npm": "^8.15.0",
+        "jsonminify": "^0.4.2",
+        "mkdirp": "^3.0.1",
+        "npm": "^11.9.0",
         "path": "^0.12.7",
-        "typescript": "^3.9.6"
+        "typescript": "^5.9.3"
     },
     "license": "MIT",
     "repository": {
