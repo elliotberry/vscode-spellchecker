@@ -1,13 +1,22 @@
 {
     "compilerOptions": {
-        "module": "commonjs",
-        "target": "es6",
-        "outDir": "out",
+        "module": "Node16",
+        "target": "ES2022",
         "lib": [
-            "es6"
+            "ES2022"
         ],
+        "moduleResolution": "node16",
+        "outDir": "out",
+        "rootDir": "src",
         "sourceMap": true,
-        "rootDir": "."
+        "strict": true,
+        "esModuleInterop": true,
+        "forceConsistentCasingInFileNames": true,
+        "skipLibCheck": true,
+        "resolveJsonModule": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "noFallthroughCasesInSwitch": true
     },
     "exclude": [
         "node_modules",

@@ -5,7 +5,7 @@
     "version": "1.4.1",
     "publisher": "swyphcosmo",
     "engines": {
-        "vscode": "^1.46.0"
+        "vscode": "^1.109.0"
     },
     "icon": "images/icon.png",
     "categories": [
@@ -14,7 +14,7 @@
     "activationEvents": [
         "onStartupFinished"
     ],
-    "main": "./out/src/extension",
+    "main": "./out/extension",
     "contributes": {
         "commands": [
             {
@@ -28,6 +28,10 @@
             {
                 "command": "spellchecker.checkDocument",
                 "title": "Spell Check Current File"
+            },
+            {
+                "command": "spellchecker.toggleAutoCheck",
+                "title": "Toggle Spell Checker Auto Check"
             }
         ],
         "keybindings": [
@@ -78,6 +82,21 @@
                     "default": [],
                     "description": "Array of regular expressions that will be used to remove text from the document before it is spell checked."
                 },
+                "spellchecker.autoCheck": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Automatically run the spell checker when a supported document is opened, saved, or edited."
+                },
+                "spellchecker.maxDiagnostics": {
+                    "type": "integer",
+                    "default": 250,
+                    "description": "Maximum number of spelling diagnostics to surface per file."
+                },
+                "spellchecker.suggestionLimit": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum number of suggestions to display for a misspelled word."
+                },
                 "spellchecker.suggestionSeverity": {
                     "default": "Warning",
                     "description": "Severity of spelling suggestions.",
@@ -94,22 +113,32 @@
         }
     },
     "scripts": {
-        "vscode:prepublish": "tsc -p ./",
-        "compile": "tsc -watch -p ./"
+        "vscode:prepublish": "npm run build",
+        "build": "tsc -p ./",
+        "watch": "tsc -w -p ./",
+        "lint": "eslint . --ext ts",
+        "format": "prettier -w \"src/**/*.ts\"",
+        "test": "npm run test:unit",
+        "test:unit": "npm run build && mocha --ui bdd --color \"out/test/**/*.test.js\"",
+        "test:extension": "vscode-test"
     },
     "devDependencies": {
         "@types/mocha": "^10.0.10",
         "@types/node": "^25.2.1",
         "@types/vscode": "^1.109.0",
+        "@typescript-eslint/eslint-plugin": "^8.54.0",
+        "@typescript-eslint/parser": "^8.54.0",
+        "eslint": "^8.57.0",
+        "eslint-config-prettier": "^9.1.0",
+        "eslint-plugin-import": "^2.31.0",
+        "mocha": "^10.4.0",
+        "prettier": "^3.4.1",
+        "typescript": "^5.9.3",
         "vscode-test": "^1.6.1"
     },
     "dependencies": {
-        "fs": "0.0.1-security",
-        "jsonminify": "^0.4.2",
-        "mkdirp": "^3.0.1",
-        "npm": "^11.9.0",
-        "path": "^0.12.7",
-        "typescript": "^5.9.3"
+        "hunspell-spellchecker": "^1.0.2",
+        "jsonminify": "^0.4.2"
     },
     "license": "MIT",
     "repository": {

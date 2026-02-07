@@ -1,800 +1,600 @@
-'use strict';
-
-import * as path from 'path';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
-let mkdirp = require('mkdirp');
-let sc = require('../../../lib/hunspell-spellchecker/lib/index.js');
-let jsonMinify = require('jsonminify');
 
-// Toggle debug output
-let DEBUG: boolean = false;
+import jsonMinify from 'jsonminify';
+
+import { DictionaryCode, SpellService } from '../services/SpellService';
+import { sanitizeText } from '../utils/textProcessing';
+
+type SeverityOption = 'Error' | 'Hint' | 'Information' | 'Warning';
 
 interface SpellSettings {
-	language: string,
+	language: DictionaryCode;
 	ignoreWordsList: string[];
 	documentTypes: string[];
 	ignoreRegExp: string[];
 	ignoreFileExtensions: string[];
 	ignoreFilenames: string[];
 	checkInterval: number;
-	suggestionSeverity: string;
+	suggestionSeverity: SeverityOption;
+	autoCheck: boolean;
+	maxDiagnostics: number;
+	suggestionLimit: number;
 }
 
-export default class SpellCheckerProvider implements vscode.CodeActionProvider {
-	private static suggestCommandId: string = 'SpellChecker.fixSuggestionCodeAction';
-	private static ignoreCommandId: string = 'SpellChecker.ignoreCodeAction';
-	private static alwaysIgnoreCommandId: string = 'SpellChecker.alwaysIgnoreCodeAction';
-	private suggestCommand: vscode.Disposable;
-	private ignoreCommand: vscode.Disposable;
-	private alwaysIgnoreCommand: vscode.Disposable;
-	private diagnosticCollection: vscode.DiagnosticCollection;
-	private problemCollection = {};
-	private diagnosticMap = {};
-	private DICT = undefined;
-	private settings: SpellSettings;
-	private static CONFIGFILE: string = '';
-	private SpellChecker = new sc();
-	private extensionRoot: string;
-	private lastcheck: number = -1;
-	private timer = null;
-	private timerTextDocument: vscode.TextDocument = null;
-	private availableLanguages = [
-		{
-			description: 'English US',
-			filename: 'en_US'
-		},
-		{
-			description: 'English UK (-ize/Oxford)',
-			filename: 'en_GB-ize'
-		},
-		{
-			description: 'English UK (-ise)',
-			filename: 'en_GB-ise'
-		},
-		{
-			description: 'Spanish',
-			filename: 'es_ANY'
-		},
-		{
-			description: 'French',
-			filename: 'fr'
-		},
-		{
-			description: 'Greek',
-			filename: 'el_GR'
-		},
-		{
-			description: 'Swedish',
-			filename: 'sv_SE'
-		}
-	];
+const DEFAULT_SETTINGS: SpellSettings = {
+	language: 'en_US',
+	ignoreWordsList: [],
+	documentTypes: ['markdown', 'latex', 'plaintext'],
+	ignoreRegExp: [],
+	ignoreFileExtensions: [],
+	ignoreFilenames: [],
+	checkInterval: 3000,
+	suggestionSeverity: 'Warning',
+	autoCheck: true,
+	maxDiagnostics: 250,
+	suggestionLimit: 5,
+};
 
-	public activate(context: vscode.ExtensionContext) {
-		let subscriptions: vscode.Disposable[] = context.subscriptions;
+export default class SpellCheckerProvider implements vscode.CodeActionProvider, vscode.Disposable {
+	private static suggestCommandId = 'SpellChecker.fixSuggestionCodeAction';
+	private static ignoreCommandId = 'SpellChecker.ignoreCodeAction';
+	private static alwaysIgnoreCommandId = 'SpellChecker.alwaysIgnoreCodeAction';
+	private static toggleAutoCheckCommandId = 'SpellChecker.toggleAutoCheck';
 
+	private readonly spellService = new SpellService();
+	private readonly diagnosticCollection = vscode.languages.createDiagnosticCollection('Spelling');
+	private readonly diagnosticMap = new Map<string, vscode.Diagnostic[]>();
+	private readonly disposables: vscode.Disposable[] = [];
+	private codeActionRegistrations: vscode.Disposable[] = [];
+	private settings: SpellSettings = DEFAULT_SETTINGS;
+	private extensionRoot = '';
+	private lastcheck = -1;
+	private timer: NodeJS.Timeout | undefined;
+	private timerTextDocument: vscode.TextDocument | undefined;
+	private statusBarItem: vscode.StatusBarItem | undefined;
+	private autoCheckEnabled = true;
+
+	public async activate(context: vscode.ExtensionContext): Promise<void> {
 		this.extensionRoot = context.extensionPath;
+		this.settings = this.loadSettings();
+		this.autoCheckEnabled = this.settings.autoCheck;
+		await this.loadDictionary(this.settings.language);
 
-		this.settings = this.getSettings();
-		this.setLanguage(this.settings.language);
+		this.registerCommands(context);
+		this.registerEventHandlers(context);
+		this.registerCodeActionProviders();
 
-		vscode.commands.registerCommand('spellchecker.showDocumentType', this.showDocumentType, this);
-		vscode.commands.registerCommand('spellchecker.checkDocument', this.doSpellCheck, this);
-		vscode.commands.registerCommand('spellchecker.setLanguage', this.setLanguageCommand, this);
+		this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+		this.statusBarItem.command = SpellCheckerProvider.toggleAutoCheckCommandId;
+		this.updateStatusBar();
+		this.statusBarItem.show();
+		context.subscriptions.push(this.statusBarItem);
 
-		this.suggestCommand = vscode.commands.registerCommand(SpellCheckerProvider.suggestCommandId, this.fixSuggestionCodeAction, this);
-		this.ignoreCommand = vscode.commands.registerCommand(SpellCheckerProvider.ignoreCommandId, this.ignoreCodeAction, this);
-		this.alwaysIgnoreCommand = vscode.commands.registerCommand(SpellCheckerProvider.alwaysIgnoreCommandId, this.alwaysIgnoreCodeAction, this);
-		subscriptions.push(this);
-		this.diagnosticCollection = vscode.languages.createDiagnosticCollection('Spelling');
-
-		vscode.workspace.onDidOpenTextDocument(this.doAutoSpellCheck, this, subscriptions);
-		vscode.workspace.onDidCloseTextDocument((textDocument) => {
-			this.diagnosticCollection.delete(textDocument.uri);
-		}, null, subscriptions);
-
-		vscode.workspace.onDidSaveTextDocument(this.doAutoSpellCheck, this, subscriptions);
-
-		vscode.workspace.onDidChangeTextDocument(this.doDiffSpellCheck, this, subscriptions);
-
-		vscode.workspace.onDidChangeConfiguration(this.settingsChanged, this);
-
-		// Register code actions provider
-		for (let i = 0; i < this.settings.documentTypes.length; i++) {
-			vscode.languages.registerCodeActionsProvider(this.settings.documentTypes[i], this);
-		}
-
-		console.log("Finished activation");
+		context.subscriptions.push(this);
 	}
 
 	public dispose(): void {
+		if (this.timer) {
+			clearTimeout(this.timer);
+		}
+
+		this.codeActionRegistrations.forEach((d) => d.dispose());
+		this.disposables.forEach((d) => d.dispose());
 		this.diagnosticCollection.clear();
 		this.diagnosticCollection.dispose();
-		this.suggestCommand.dispose();
-		this.ignoreCommand.dispose();
-		this.alwaysIgnoreCommand.dispose();
+		this.statusBarItem?.dispose();
 	}
 
-	public settingsChanged(): void {
-		this.settings = this.getSettings();
-		this.setLanguage(this.settings.language);
+	public provideCodeActions(
+		document: vscode.TextDocument,
+		_range: vscode.Range,
+		context: vscode.CodeActionContext,
+		_token: vscode.CancellationToken,
+	): vscode.CodeAction[] | undefined {
+		const diagnostic = context.diagnostics.find((d) => typeof d.code === 'string');
+		if (!diagnostic || typeof diagnostic.code !== 'string') {
+			return;
+		}
+
+		const word = diagnostic.code;
+		const suggestions = this.safeSuggest(word);
+
+		const actions: vscode.CodeAction[] = suggestions.map((suggestion, index) => {
+			const action = new vscode.CodeAction(
+				`Replace with '${suggestion}'`,
+				vscode.CodeActionKind.QuickFix,
+			);
+			action.command = {
+				command: SpellCheckerProvider.suggestCommandId,
+				title: 'Apply spelling suggestion',
+				arguments: [document.uri, diagnostic.range, suggestion],
+			};
+			action.diagnostics = [diagnostic];
+			action.isPreferred = index === 0;
+			return action;
+		});
+
+		const ignore = new vscode.CodeAction(
+			`Ignore '${word}'`,
+			vscode.CodeActionKind.QuickFix,
+		);
+		ignore.command = {
+			command: SpellCheckerProvider.ignoreCommandId,
+			title: 'Ignore word in workspace',
+			arguments: [document.uri, word, vscode.ConfigurationTarget.Workspace],
+		};
+		ignore.diagnostics = [diagnostic];
+		actions.push(ignore);
+
+		const alwaysIgnore = new vscode.CodeAction(
+			`Always ignore '${word}'`,
+			vscode.CodeActionKind.QuickFix,
+		);
+		alwaysIgnore.command = {
+			command: SpellCheckerProvider.alwaysIgnoreCommandId,
+			title: 'Ignore word globally',
+			arguments: [document.uri, word],
+		};
+		alwaysIgnore.diagnostics = [diagnostic];
+		actions.push(alwaysIgnore);
+
+		return actions;
+	}
+
+	private registerCommands(context: vscode.ExtensionContext): void {
+		this.disposables.push(
+			vscode.commands.registerCommand(
+				'spellchecker.showDocumentType',
+				this.showDocumentType,
+				this,
+			),
+			vscode.commands.registerCommand('spellchecker.checkDocument', () =>
+				this.doSpellCheck(vscode.window.activeTextEditor?.document),
+			),
+			vscode.commands.registerCommand('spellchecker.setLanguage', this.setLanguageCommand, this),
+			vscode.commands.registerCommand(
+				SpellCheckerProvider.suggestCommandId,
+				this.applySuggestion,
+				this,
+			),
+			vscode.commands.registerCommand(
+				SpellCheckerProvider.ignoreCommandId,
+				this.ignoreCodeAction,
+				this,
+			),
+			vscode.commands.registerCommand(
+				SpellCheckerProvider.alwaysIgnoreCommandId,
+				this.alwaysIgnoreCodeAction,
+				this,
+			),
+			vscode.commands.registerCommand(
+				SpellCheckerProvider.toggleAutoCheckCommandId,
+				this.toggleAutoCheck,
+				this,
+			),
+		);
+
+		context.subscriptions.push(...this.disposables);
+	}
+
+	private registerCodeActionProviders(): void {
+		this.codeActionRegistrations.forEach((d) => d.dispose());
+		this.codeActionRegistrations = this.settings.documentTypes.map((language) =>
+			vscode.languages.registerCodeActionsProvider(
+				{ language, scheme: 'file' },
+				this,
+				{ providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] },
+			),
+		);
+	}
+
+	private registerEventHandlers(context: vscode.ExtensionContext): void {
+		context.subscriptions.push(
+			vscode.workspace.onDidOpenTextDocument(this.maybeAutoCheck, this),
+			vscode.workspace.onDidSaveTextDocument(this.maybeAutoCheck, this),
+			vscode.workspace.onDidCloseTextDocument((doc) => {
+				this.diagnosticCollection.delete(doc.uri);
+				this.diagnosticMap.delete(doc.uri.toString());
+			}),
+			vscode.workspace.onDidChangeTextDocument(this.onDocumentChanged, this),
+			vscode.workspace.onDidChangeConfiguration(this.settingsChanged, this),
+		);
+	}
+
+	private async settingsChanged(): Promise<void> {
+		this.settings = this.loadSettings();
+		this.autoCheckEnabled = this.settings.autoCheck;
+		await this.loadDictionary(this.settings.language);
+		this.registerCodeActionProviders();
+		this.updateStatusBar();
 	}
 
 	private showDocumentType(): void {
-		if (vscode.workspace.textDocuments.length > 0) {
-			vscode.window.showInformationMessage('The documentType for the current file is \'' + vscode.workspace.textDocuments[0].languageId + '\'.');
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			vscode.window.showErrorMessage('No active document found.');
+			return;
 		}
-		else {
-			vscode.window.showErrorMessage('documentType not found.');
-		}
+		vscode.window.showInformationMessage(
+			`The documentType for the current file is '${editor.document.languageId}'.`,
+		);
 	}
 
-	private setLanguageCommand(): void {
-		let qpOptions: vscode.QuickPickOptions =
-		{
-			placeHolder: 'Select one of the available languages:'
+	private async setLanguageCommand(): Promise<void> {
+		const qpOptions: vscode.QuickPickOptions = {
+			placeHolder: 'Select one of the available languages:',
 		};
-		let options = [];
 
-		this.availableLanguages.forEach(function (value) {
-			options.push(value.description + ' (' + value.filename + ')');
-		});
+		const options = [
+			{ label: 'English US', value: 'en_US' as DictionaryCode },
+			{ label: 'English UK (-ize/Oxford)', value: 'en_GB-ize' as DictionaryCode },
+			{ label: 'English UK (-ise)', value: 'en_GB-ise' as DictionaryCode },
+			{ label: 'Spanish', value: 'es_ANY' as DictionaryCode },
+			{ label: 'French', value: 'fr' as DictionaryCode },
+			{ label: 'Greek', value: 'el_GR' as DictionaryCode },
+			{ label: 'Swedish', value: 'sv_SE' as DictionaryCode },
+		];
 
-		vscode.window.showQuickPick(options, qpOptions).then(val => {
-			let language = val.match(/\(.*\)/g)[0];
-			language = language.substring(1, language.length - 1);
-			this.setLanguage(language);
-		});
+		const picked = await vscode.window.showQuickPick(
+			options.map((o) => `${o.label} (${o.value})`),
+			qpOptions,
+		);
+		if (!picked) {
+			return;
+		}
+
+		const match = picked.match(/\((.*)\)/);
+		const language = this.normalizeLanguage(match ? match[1] : '');
+		await this.setLanguage(language);
 	}
 
-	private doDiffSpellCheck(event: vscode.TextDocumentChangeEvent) {
-		// Is this a document type that we should check?
-		if (this.settings.documentTypes.indexOf(event.document.languageId) < 0) {
+	private async onDocumentChanged(event: vscode.TextDocumentChangeEvent): Promise<void> {
+		if (!this.shouldCheck(event.document)) {
 			return;
 		}
 
-		// Is this a file extension that we should ignore?
-		if (this.settings.ignoreFileExtensions.indexOf(path.extname(event.document.fileName)) >= 0) {
-			return;
-		}
-
-		// Is this a filename that should be ignored?
-		if (this.settings.ignoreFilenames.indexOf(path.basename(event.document.fileName)) >= 0) {
-			return
-		}
-
-		// If checkInterval is negative, the document will not be automatically checked
-		if (this.settings.checkInterval < 0) {
+		if (this.settings.checkInterval < 0 || !this.autoCheckEnabled) {
 			return;
 		}
 
 		if (Date.now() - this.lastcheck > this.settings.checkInterval) {
-			clearTimeout(this.timer);
-			this.doSpellCheck(event.document);
-		}
-		else {
-			clearTimeout(this.timer);
+			if (this.timer) {
+				clearTimeout(this.timer);
+				this.timer = undefined;
+			}
+			await this.doSpellCheck(event.document);
+		} else {
+			if (this.timer) {
+				clearTimeout(this.timer);
+			}
 			this.timerTextDocument = event.document;
-			this.timer = setTimeout(this.doSpellCheck.bind(this), 2 * this.settings.checkInterval);
+			this.timer = setTimeout(
+				() => void this.doSpellCheck(this.timerTextDocument ?? event.document),
+				2 * this.settings.checkInterval,
+			);
 		}
 	}
 
-	private doAutoSpellCheck(textDocument: vscode.TextDocument) {
-		// If checkInterval is negative, the document will not be automatically checked
-		if (this.settings.checkInterval < 0) {
+	private maybeAutoCheck(document: vscode.TextDocument): void {
+		if (this.settings.checkInterval < 0 || !this.autoCheckEnabled) {
 			return;
 		}
-
-		this.doSpellCheck(textDocument);
+		if (!this.shouldCheck(document)) {
+			return;
+		}
+		void this.doSpellCheck(document);
 	}
 
-	private doSpellCheck(textDocument: vscode.TextDocument) {
-		if (textDocument == null || textDocument.fileName == null) {
-			if (this.timerTextDocument == null) {
-				textDocument = vscode.window.activeTextEditor.document;
-			}
-			else {
-				textDocument = this.timerTextDocument;
-			}
-		}
+	private async doSpellCheck(textDocument?: vscode.TextDocument): Promise<void> {
+		const document =
+			textDocument ??
+			vscode.window.activeTextEditor?.document ??
+			(this.timerTextDocument ?? undefined);
 
-		if (textDocument == null || textDocument.fileName == null) {
+		if (!document || !document.fileName) {
 			return;
 		}
 
-		if (DEBUG) {
-			console.log("documentType for " + textDocument.fileName + " is " + textDocument.languageId);
-		}
-
-		if (DEBUG) {
-			console.log(textDocument);
-		}
-
-		// Is this a private URI? (VSCode started having "private:" versions of non-plaintext documents with languageId = 'plaintext')
-		if (textDocument.uri.scheme != "file") {
+		if (!this.shouldCheck(document)) {
 			return;
 		}
 
-		// Is this a document type that we should check?
-		if (this.settings.documentTypes.indexOf(textDocument.languageId) < 0) {
-			return;
-		}
+		const text = document.getText().replace(/\r?\n/g, '\n');
+		const sanitized = sanitizeText(text, { userPatterns: this.getUserRegexps() });
+		const diagnostics: vscode.Diagnostic[] = [];
+		let processedTokens = 0;
 
-		// Is this a file extension that we should ignore?
-		if (this.settings.ignoreFileExtensions.indexOf(path.extname(textDocument.fileName)) >= 0) {
-			return;
-		}
+		const wordRegex = /[A-Za-z][A-Za-z'’]{3,}/g;
+		for (const match of sanitized.matchAll(wordRegex)) {
+			if (match.index === undefined) {
+				continue;
+			}
+			processedTokens += 1;
 
-		// Is this a filename that should be ignored?
-		if (this.settings.ignoreFilenames.indexOf(path.basename(textDocument.fileName)) >= 0) {
-			return
-		}
+			const originalWord = match[0];
+			const normalizedWord = originalWord.replace(/’/g, '\'');
 
-		let startTime = new Date().getTime();
-		let lastSeconds: number = 0;
-		if (DEBUG) {
-			console.log('Starting spell check on ' + textDocument.fileName);
-		}
+			if (/\d/.test(normalizedWord)) {
+				continue;
+			}
 
-		let diagnostics: vscode.Diagnostic[] = [];
+			if (this.settings.ignoreWordsList.includes(normalizedWord)) {
+				continue;
+			}
 
-		let textoriginal = textDocument.getText();
+			if (!this.spellService.check(normalizedWord)) {
+				const start = document.positionAt(match.index);
+				const end = document.positionAt(match.index + originalWord.length);
+				const range = new vscode.Range(start, end);
+				const diag = new vscode.Diagnostic(
+					range,
+					`Spelling: ${normalizedWord}`,
+					this.getSeverity(),
+				);
+				diag.source = 'Spell Checker';
+				diag.code = normalizedWord;
+				diagnostics.push(diag);
 
-		// Change to common line endings
-		textoriginal = textoriginal.replace(/\r?\n/g, '\n');
-		let text = textoriginal;
-
-		if (DEBUG) {
-			console.log('Original text');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-
-		text = this.processUserIgnoreRegex(text);
-		if (DEBUG) {
-			console.log('Processed User Regex');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-
-		// remove pandoc yaml header
-		text = text.replace(/-{3}(.|\n)*\n(\.{3}|\-{3})/g, ' ');
-		if (DEBUG) {
-			console.log('Remove yaml header');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove '&nbsp;'
-		text = text.replace(/&nbsp;/g, ' ');
-		if (DEBUG) {
-			console.log('Remove `&nbsp;`');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove citations
-		text = text.replace(/\[-?@[A-Za-z:0-9\-]*\]/g, ' ');
-		text = text.replace(/\{(\#|\.)[A-Za-z:0-9]+\}/g, ' ');
-		if (DEBUG) {
-			console.log('Remove citations');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove code blocks
-		text = text.replace(/^(```\s*)(\w+)?(\s*[\w\W]+?\n*)(```\s*)\n*$/gm, ' ');
-		if (DEBUG) {
-			console.log('Remove code blocks');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove inline code blocks
-		text = text.replace(/`[\w\W]+?`/g, ' ');
-		if (DEBUG) {
-			console.log('Remove inline code blocks');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove image links
-		text = text.replace(/\(.*\.(jpg|jpeg|png|md|gif|pdf|svg)\)/gi, ' ');
-		if (DEBUG) {
-			console.log('Remove links');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove web links
-		text = text.replace(/(http|https|ftp|git)\S*/g, ' ')
-		if (DEBUG) {
-			console.log('Remove web links');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove email addresses 
-		text = text.replace(/[a-zA-Z.\-0-9]+@[a-z.]+/g, ' ');
-		if (DEBUG) {
-			console.log('Remove email addresses');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove non-letter characters
-		text = text.replace(/[`\"!#$%&()*+,.\/:;<=>?@\[\]\\^_{|}\n\r\-~]/g, ' ');
-		if (DEBUG) {
-			console.log('Remove non-letter characters');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove numbers:
-		text = text.replace(/ [0-9]+/g, ' ');
-		if (DEBUG) {
-			console.log('Remove numbers');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove leading quotations
-		text = text.replace(/[\s ]['"]([a-zA-Z0-9])/g, ' $1');
-		if (DEBUG) {
-			console.log('Remove leading quotations');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove trailing quotations
-		text = text.replace(/' /g, ' ');
-		if (DEBUG) {
-			console.log('Remove trailing quotations');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// convert tabs to spaces
-		text = text.replace(/\t/g, ' ');
-		if (DEBUG) {
-			console.log('Convert tabs to spaces');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-		// remove LaTeX commands
-		text = text.replace(/\\\w*\{.*?\}/g, ' ');
-		if (DEBUG) {
-			console.log('Remove LaTeX commands');
-			console.log(text);
-			console.log('------------------------------------------');
-		}
-
-		let lastposition = 0;
-		let position = 0;
-		let linenumber = 0;
-		let colnumber = 0;
-		let lastline = 0;
-
-		let tokens = text.split(' ');
-		let lines = textoriginal.split('\n');
-
-		if (DEBUG) {
-			console.log('Num tokens: ' + String(tokens.length));
-		}
-
-		for (let i in tokens) {
-			if (DEBUG) {
-				let currTime = new Date().getTime();
-				let seconds: number = Math.floor((currTime - startTime) / 1000);
-
-				if (seconds % 10 == 0 && lastSeconds != seconds) {
-					lastSeconds = seconds;
-					console.log("Elapsed time: " + seconds + " seconds");
+				if (diagnostics.length >= this.settings.maxDiagnostics) {
+					vscode.window.setStatusBarMessage(
+						`Over ${this.settings.maxDiagnostics} spelling errors found!`,
+						5000,
+					);
+					break;
 				}
 			}
 
-			let token = tokens[i];
-			if (token.length > 3) {
-				// find line number and column number
-				position = lines[linenumber].indexOf(token, lastposition);
-				while (position < 0) {
-					lastposition = 0;
-					linenumber++;
-					if (linenumber < lines.length) {
-						position = lines[linenumber].indexOf(token, lastposition);
-					}
-					else {
-						console.log('Error text not found: ' + token);
-					}
-				}
-
-				colnumber = position;
-				lastposition = position;
-
-				if (token.indexOf('’') >= 0) {
-					token = token.replace(/’/, '\'');
-				}
-
-				if (!this.SpellChecker.check(token)) {
-					if (DEBUG) {
-						console.log('Error: \'' + token + '\', line ' + String(linenumber + 1) + ', col ' + String(colnumber + 1));
-					}
-
-					let lineRange = new vscode.Range(linenumber, colnumber, linenumber, colnumber + token.length);
-
-					// Make sure word isn't in the ignore list
-					if (this.settings.ignoreWordsList.indexOf(token) < 0) {
-						if (token in this.problemCollection) {
-							let diag = new vscode.Diagnostic(lineRange, this.problemCollection[token], this.getSeverity());
-							diag.source = 'Spell Checker';
-							diagnostics.push(diag);
-						}
-						else {
-							let message = 'Spelling [ ' + token + ' ]: suggestions [ ';
-							let containsNumber = token.match(/[0-9]+/g);
-
-							if (token.length < 50 && containsNumber == null) {
-								let suggestions = this.SpellChecker.suggest(token);
-								for (let s of suggestions) {
-									message += s + ', ';
-								}
-								if (suggestions.length > 0) {
-									message = message.slice(0, message.length - 2);
-								}
-							}
-							message += ' ]';
-
-							if (DEBUG) {
-								console.log(message);
-							}
-
-							let diag = new vscode.Diagnostic(lineRange, message, this.getSeverity());
-							diag.source = 'Spell Checker';
-							diagnostics.push(diag);
-
-							if (diagnostics.length > 250) {
-								vscode.window.setStatusBarMessage("Over 250 spelling errors found!", 5000);
-								break;
-							}
-
-							this.problemCollection[token] = message;
-						}
-					}
-				}
+			if (processedTokens >= this.settings.maxDiagnostics * 20) {
+				// avoid processing massive files for too long
+				break;
 			}
 		}
-		this.diagnosticCollection.set(textDocument.uri, diagnostics);
-		// create local copy so it can be updated
-		this.diagnosticMap[textDocument.uri.toString()] = diagnostics;
 
-		let endTime = new Date().getTime();
-		let minutes = (endTime - startTime) / 1000;
-		if (DEBUG) {
-			console.log('Check completed in ' + String(minutes));
-			console.log('Found ' + String(diagnostics.length) + ' errors');
-		}
-
+		this.diagnosticCollection.set(document.uri, diagnostics);
+		this.diagnosticMap.set(document.uri.toString(), diagnostics);
 		this.lastcheck = Date.now();
 	}
 
+	private getUserRegexps(): RegExp[] {
+		const result: RegExp[] = [];
+		for (const value of this.settings.ignoreRegExp) {
+			try {
+				const flags = value.replace(/.*\/([gimy]*)$/, '$1');
+				const pattern = value.replace(new RegExp(`^/(.*?)/${flags}$`), '$1').replace(/\\\\/g, '\\');
+				result.push(new RegExp(pattern, flags));
+			} catch (error) {
+				console.warn('Invalid ignoreRegExp entry skipped', error);
+			}
+		}
+		return result;
+	}
+
 	private getSeverity(): vscode.DiagnosticSeverity {
-		if (this.settings.suggestionSeverity == "Error") {
-			return vscode.DiagnosticSeverity.Error;
+		switch (this.settings.suggestionSeverity) {
+			case 'Error':
+				return vscode.DiagnosticSeverity.Error;
+			case 'Hint':
+				return vscode.DiagnosticSeverity.Hint;
+			case 'Information':
+				return vscode.DiagnosticSeverity.Information;
+			case 'Warning':
+			default:
+				return vscode.DiagnosticSeverity.Warning;
 		}
-		if (this.settings.suggestionSeverity == "Hint") {
-			return vscode.DiagnosticSeverity.Hint;
-		}
-		if (this.settings.suggestionSeverity == "Information") {
-			return vscode.DiagnosticSeverity.Information;
-		}
-		if (this.settings.suggestionSeverity == "Warning") {
-			return vscode.DiagnosticSeverity.Warning;
-		}
-
-		// Should not be reached
-		return vscode.DiagnosticSeverity.Warning;
 	}
 
-	private processUserIgnoreRegex(text: string): string {
-		for (let i = 0; i < this.settings.ignoreRegExp.length; i++) {
-			// Convert the JSON of regExp Strings into a real RegExp
-			let flags = this.settings.ignoreRegExp[i].replace(/.*\/([gimy]*)$/, '$1');
-			let pattern = this.settings.ignoreRegExp[i].replace(new RegExp('^/(.*?)/' + flags + '$'), '$1');
+	private safeSuggest(word: string): string[] {
+		try {
+			return this.spellService.suggest(word, this.settings.suggestionLimit);
+		} catch {
+			return [];
+		}
+	}
 
-			pattern = pattern.replace(/\\\\/g, '\\');
+	private async applySuggestion(uri: vscode.Uri, range: vscode.Range, suggestion: string): Promise<void> {
+		const edit = new vscode.WorkspaceEdit();
+		edit.replace(uri, range, suggestion);
+		await vscode.workspace.applyEdit(edit);
+		const document = vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === uri.toString());
+		if (document) {
+			await this.doSpellCheck(document);
+		}
+	}
 
-			if (DEBUG) {
-				console.log(this.settings.ignoreRegExp[i]);
-				console.log(pattern);
-				console.log(flags);
+	private async ignoreCodeAction(
+		uri: vscode.Uri,
+		word: string,
+		target: vscode.ConfigurationTarget,
+	): Promise<void> {
+		if (this.addWordToIgnoreList(word, target)) {
+			const document = vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === uri.toString());
+			if (document) {
+				await this.doSpellCheck(document);
 			}
-
-			let regex = new RegExp(pattern, flags);
-
-			if (DEBUG) {
-				console.log(text.match(regex));
-			}
-
-			text = text.replace(regex, ' ');
-
-		}
-
-		return text;
-	}
-
-	public provideCodeActions(document: vscode.TextDocument, range: vscode.Range, context: vscode.CodeActionContext, token: vscode.CancellationToken): vscode.Command[] {
-		let diagnostic: vscode.Diagnostic = context.diagnostics[0];
-
-		if (!diagnostic)
-			return null;
-
-		// Get word
-		let match: string[] = diagnostic.message.match(/^Spelling \[\ (.+)\ \]\:/);
-		if (DEBUG && match) {
-			console.log('Code action: match word');
-			match.forEach(function (m) {
-				console.log(m);
-			});
-		}
-		let word: string = '';
-
-		// should always be true
-		if (match.length >= 2) {
-			word = match[1];
-		}
-
-		if (word.length == 0) {
-			return undefined;
-		}
-
-		// Get suggestions
-		match = diagnostic.message.match(/suggestions \[\ (.+)\ \]$/);
-		if (DEBUG && match) {
-			console.log('Code action: match suggestions');
-			match.forEach(function (m) {
-				console.log(m);
-			});
-		}
-		let suggestionstring: string = '';
-
-		let commands: vscode.Command[] = [];
-
-		if (match && match.length >= 2) {
-			suggestionstring = match[1];
-
-			let suggestions: string[] = suggestionstring.split(/\,\ /g);
-
-			// Add suggestions to command list
-			suggestions.forEach(function (suggestion) {
-				commands.push({
-					title: 'Replace with \'' + suggestion + '\'',
-					command: SpellCheckerProvider.suggestCommandId,
-					arguments: [document, diagnostic, word, suggestion]
-				});
-			});
-		}
-
-		commands.push({
-			title: 'Ignore \'' + word + '\'',
-			command: SpellCheckerProvider.ignoreCommandId,
-			arguments: [document, word]
-		});
-
-		commands.push({
-			title: 'Always ignore \'' + word + '\'',
-			command: SpellCheckerProvider.alwaysIgnoreCommandId,
-			arguments: [document, word]
-		});
-
-		return commands;
-	}
-
-	private fixSuggestionCodeAction(document: vscode.TextDocument, diagnostic: vscode.Diagnostic, word: string, suggestion: string): any {
-		let docWord: string = document.getText(diagnostic.range);
-
-		if (word == docWord) {
-			// Remove diagnostic from list
-			let diagnostics: vscode.Diagnostic[] = this.diagnosticMap[document.uri.toString()];
-			let index: number = diagnostics.indexOf(diagnostic);
-
-			diagnostics.splice(index, 1);
-
-			// Update with new diagnostics
-			this.diagnosticMap[document.uri.toString()] = diagnostics;
-			this.diagnosticCollection.set(document.uri, diagnostics);
-
-			// Insert the new text
-			let edit = new vscode.WorkspaceEdit();
-			edit.replace(document.uri, diagnostic.range, suggestion);
-			return vscode.workspace.applyEdit(edit);
-		}
-		else {
-			vscode.window.showErrorMessage('The suggestion was not applied because it is out of date. You might have tried to apply the same edit twice.');
+		} else {
+			vscode.window.showWarningMessage(
+				'The word has already been added to the ignore list.',
+			);
 		}
 	}
 
-	private ignoreCodeAction(document: vscode.TextDocument, word: string): any {
-		if (this.addWordToIgnoreList(word, true)) {
-			this.doSpellCheck(document);
-		}
-		else {
-			vscode.window.showWarningMessage('The word has already been added to the ignore list. You might have tried to add the same word twice.');
-		}
+	private async alwaysIgnoreCodeAction(uri: vscode.Uri, word: string): Promise<void> {
+		await this.ignoreCodeAction(uri, word, vscode.ConfigurationTarget.Global);
 	}
 
-	private alwaysIgnoreCodeAction(document: vscode.TextDocument, word: string): any {
-		if (DEBUG) {
-			console.log(word);
-			console.log(document);
-			console.log(Object.keys(document));
+	private addWordToIgnoreList(word: string, target: vscode.ConfigurationTarget): boolean {
+		if (this.settings.ignoreWordsList.includes(word)) {
+			return false;
 		}
-		if (this.addWordToAlwaysIgnoreList(word)) {
-			this.doSpellCheck(document);
+
+		this.settings.ignoreWordsList = this.getUniqueArray([...this.settings.ignoreWordsList, word]);
+		const userSettingsData = vscode.workspace.getConfiguration('spellchecker');
+		const inspection = userSettingsData.inspect<string[]>('ignoreWordsList');
+
+		let updated: string[] = [];
+		if (target === vscode.ConfigurationTarget.Workspace && Array.isArray(inspection?.workspaceValue)) {
+			updated = inspection?.workspaceValue ?? [];
+		} else if (target === vscode.ConfigurationTarget.Global && Array.isArray(inspection?.globalValue)) {
+			updated = inspection?.globalValue ?? [];
 		}
-		else {
-			vscode.window.showWarningMessage('The word has already been added to the ignore list. You might have tried to add the same word twice.');
-		}
+
+		updated.push(word);
+		userSettingsData.update('ignoreWordsList', this.getUniqueArray(updated), target);
+		return true;
 	}
 
-	public addWordToIgnoreList(word: string, save: boolean): boolean {
-		// Only add the word if it's not already in the list
-		if (this.settings.ignoreWordsList.indexOf(word) < 0) {
-			this.settings.ignoreWordsList.push(word);
-			if (save) {
-				let userSettingsData: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('spellchecker');
-
-				let inspection = userSettingsData.inspect('ignoreWordsList');
-				let ignoreWordsList: Array<string> = []
-				if (inspection.workspaceValue instanceof Array) {
-					ignoreWordsList = inspection.workspaceValue;
-				}
-				ignoreWordsList.push(word);
-				userSettingsData.update('ignoreWordsList', this.getUniqueArray(ignoreWordsList), vscode.ConfigurationTarget.Workspace);
-			}
-			return true;
-		}
-
-		return false;
-	}
-
-	public addWordToAlwaysIgnoreList(word: string): boolean {
-		if (this.addWordToIgnoreList(word, false)) {
-			let userSettingsData: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('spellchecker');
-
-			let inspection = userSettingsData.inspect('ignoreWordsList');
-			let ignoreWordsList: Array<string> = []
-			if (inspection.globalValue instanceof Array) {
-				ignoreWordsList = inspection.globalValue;
-			}
-			ignoreWordsList.push(word);
-			userSettingsData.update('ignoreWordsList', this.getUniqueArray(ignoreWordsList), vscode.ConfigurationTarget.Global);
-			return true;
-		}
-		return false;
-	}
-
-	public setLanguage(language: string = 'en_US'): void {
+	private async setLanguage(language: DictionaryCode): Promise<void> {
+		await this.loadDictionary(language);
 		this.settings.language = language;
-		this.DICT = this.SpellChecker.parse(
-			{
-				aff: fs.readFileSync(path.join(this.extensionRoot, 'languages', this.settings.language + '.aff')),
-				dic: fs.readFileSync(path.join(this.extensionRoot, 'languages', this.settings.language + '.dic'))
-			});
-
-		this.SpellChecker.use(this.DICT);
+		await this.doSpellCheck(vscode.window.activeTextEditor?.document);
+		this.updateStatusBar();
 	}
 
-	public getDocumentTypes(): string[] {
-		return this.settings.documentTypes;
+	private async loadDictionary(language: DictionaryCode): Promise<void> {
+		try {
+			await this.spellService.load(language, this.extensionRoot);
+		} catch (error) {
+			vscode.window.showErrorMessage(`Failed to load dictionary ${language}: ${String(error)}`);
+		}
 	}
 
-	private getUniqueArray(array): string[] {
-		let a: string[] = array.concat();
-		for (var i = 0; i < a.length; ++i) {
-			for (var j = i + 1; j < a.length; ++j) {
-				if (a[i] === a[j]) {
-					a.splice(j--, 1);
-				}
-			}
-		}
-
-		return a;
+	private getUniqueArray(array: string[]): string[] {
+		return Array.from(new Set(array));
 	}
 
-	private migrateWorkspaceSettings(): void {
-		let qpOptions: vscode.QuickPickOptions =
-		{
-			placeHolder: 'Settings are now included in \'settings.json\'. What would you like to do?'
-		};
-		let options = [
-			'Migrate and delete \'spellchecker.json\'',
-			'Migrate and keep \'spellchecker.json\'',
-			'Ignore migration for now (settings will still be loaded)'
-		]
-		vscode.window.showQuickPick(options, qpOptions).then(val => {
-			let migrate: boolean = false;
-			let deleteOriginal: boolean = false;
+	private shouldCheck(document: vscode.TextDocument): boolean {
+		if (!this.spellService.isReady()) {
+			return false;
+		}
 
-			switch (val) {
-				case 'Migrate and delete \'spellchecker.json\'':
-					{
-						migrate = true;
-						deleteOriginal = true;
-						break;
-					}
-				case 'Migrate settings and keep \'spellchecker.json\'':
-					{
-						migrate = true;
-						deleteOriginal = false;
-						break;
-					}
-				case 'Ignore migration for now (settings will still be loaded)':
-					{
-						migrate = false;
-						deleteOriginal = false;
-						break;
-					}
-			}
+		if (document.uri.scheme !== 'file') {
+			return false;
+		}
 
-			let settings: SpellSettings = JSON.parse(jsonMinify(fs.readFileSync(SpellCheckerProvider.CONFIGFILE, 'utf-8')));
+		if (!this.settings.documentTypes.includes(document.languageId)) {
+			return false;
+		}
 
-			if (migrate) {
-				// Check user settings
-				let userSettingsData: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('spellchecker');
-				Object.keys(settings).forEach(function (key) {
-					if (Array.isArray(settings[key]))
-						userSettingsData.update(key, this.getUniqueArray(settings[key].concat(userSettingsData[key])), false);
-					else
-						userSettingsData.update(key, settings[key], false);
-				}, this);
+		if (this.settings.ignoreFileExtensions.includes(path.extname(document.fileName))) {
+			return false;
+		}
 
-			}
-			else {
-				let userSettingsData = this.settings;
-				Object.keys(settings).forEach(function (key) {
-					if (Array.isArray(settings[key]))
-						userSettingsData[key] = this.getUniqueArray(settings[key].concat(userSettingsData[key]));
-					else
-						userSettingsData[key] = settings[key];
-				}, this);
+		if (this.settings.ignoreFilenames.includes(path.basename(document.fileName))) {
+			return false;
+		}
 
-				this.settings = userSettingsData;
-				this.setLanguage(this.settings.language);
-			}
-
-			if (deleteOriginal) {
-				fs.unlinkSync(SpellCheckerProvider.CONFIGFILE);
-			}
-		});
+		return true;
 	}
 
-	private getSettings(): SpellSettings {
-		let returnSettings: SpellSettings = {
-			language: 'en_US',
-			ignoreWordsList: [],
-			documentTypes: ['markdown', 'latex', 'plaintext'],
-			ignoreRegExp: [],
-			ignoreFileExtensions: [],
-			ignoreFilenames: [],
-			checkInterval: 5000,
-			suggestionSeverity: "Warning",
-		};
+	private loadSettings(): SpellSettings {
+		const config = vscode.workspace.getConfiguration('spellchecker');
+		const merged: SpellSettings = { ...DEFAULT_SETTINGS };
 
-		// Check user settings
-		let userSettingsData: vscode.WorkspaceConfiguration = vscode.workspace.getConfiguration('spellchecker');
+		merged.language = this.normalizeLanguage(config.get<string>('language', merged.language));
+		merged.ignoreWordsList = this.ensureStringArray(config.get('ignoreWordsList', merged.ignoreWordsList));
+		merged.documentTypes = this.ensureStringArray(config.get('documentTypes', merged.documentTypes));
+		merged.ignoreRegExp = this.ensureStringArray(config.get('ignoreRegExp', merged.ignoreRegExp));
+		merged.ignoreFileExtensions = this.ensureStringArray(
+			config.get('ignoreFileExtensions', merged.ignoreFileExtensions),
+		);
+		merged.ignoreFilenames = this.ensureStringArray(
+			config.get('ignoreFilenames', merged.ignoreFilenames),
+		);
+		const checkInterval = config.get<number>('checkInterval', merged.checkInterval);
+		merged.checkInterval = Number.isFinite(checkInterval) ? checkInterval : merged.checkInterval;
+		merged.suggestionSeverity = this.normalizeSeverity(
+			config.get<SeverityOption>('suggestionSeverity', merged.suggestionSeverity),
+		);
+		merged.autoCheck = config.get<boolean>('autoCheck', merged.autoCheck);
+		const maxDiagnostics = config.get<number>('maxDiagnostics', merged.maxDiagnostics);
+		merged.maxDiagnostics = Number.isFinite(maxDiagnostics) ? maxDiagnostics : merged.maxDiagnostics;
+		const suggestionLimit = config.get<number>('suggestionLimit', merged.suggestionLimit);
+		merged.suggestionLimit = Number.isFinite(suggestionLimit) ? suggestionLimit : merged.suggestionLimit;
 
-		// If there are spellchecker settings in the user settings file
-		if (userSettingsData) {
-			// overwrite default settings with user settings
-			Object.keys(returnSettings).forEach(function (key) {
-				if (userSettingsData[key]) {
-					returnSettings[key] = userSettingsData[key];
-				}
-			});
+		const legacy = this.loadLegacySettings();
+		if (legacy) {
+			merged.ignoreWordsList = this.getUniqueArray([
+				...merged.ignoreWordsList,
+				...(legacy.ignoreWordsList ?? []),
+			]);
+			merged.ignoreRegExp = this.getUniqueArray([...merged.ignoreRegExp, ...(legacy.ignoreRegExp ?? [])]);
 		}
 
-		// If we are in a workspace, get the spellchecker settings file
-		if (SpellCheckerProvider.CONFIGFILE.length == 0 && vscode.workspace.rootPath) {
-			SpellCheckerProvider.CONFIGFILE = path.join(vscode.workspace.rootPath, '.vscode', 'spellchecker.json');
+		return merged;
+	}
+
+	private loadLegacySettings(): Partial<SpellSettings> | undefined {
+		const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+		if (!workspaceFolder) {
+			return;
 		}
 
-		if (SpellCheckerProvider.CONFIGFILE.length > 0 && fs.existsSync(SpellCheckerProvider.CONFIGFILE)) {
-			this.migrateWorkspaceSettings();
-		}
-		else {
-			if (DEBUG) {
-				console.log('Workspace configuration file not found: \'' + SpellCheckerProvider.CONFIGFILE + '\'');
-			}
+		const configFile = path.join(workspaceFolder.uri.fsPath, '.vscode', 'spellchecker.json');
+		if (!fs.existsSync(configFile)) {
+			return;
 		}
 
-		return returnSettings;
+		try {
+			const raw = fs.readFileSync(configFile, 'utf-8');
+			const minified = jsonMinify(raw);
+			const parsed = JSON.parse(minified);
+			return parsed as Partial<SpellSettings>;
+		} catch (error) {
+			vscode.window.showWarningMessage(
+				`Could not read legacy spellchecker.json: ${String(error)}`,
+			);
+			return;
+		}
+	}
+
+	private ensureStringArray(value: unknown): string[] {
+		if (!Array.isArray(value)) {
+			return [];
+		}
+		return value.filter((item): item is string => typeof item === 'string');
+	}
+
+	private normalizeSeverity(value: SeverityOption): SeverityOption {
+		if (['Error', 'Hint', 'Information', 'Warning'].includes(value)) {
+			return value;
+		}
+		return 'Warning';
+	}
+
+	private normalizeLanguage(language: string): DictionaryCode {
+		const allowed: DictionaryCode[] = [
+			'en_US',
+			'en_GB-ize',
+			'en_GB-ise',
+			'es_ANY',
+			'fr',
+			'el_GR',
+			'sv_SE',
+		];
+		return allowed.includes(language as DictionaryCode) ? (language as DictionaryCode) : 'en_US';
+	}
+
+	private toggleAutoCheck(): void {
+		this.autoCheckEnabled = !this.autoCheckEnabled;
+		this.updateStatusBar();
+		const message = this.autoCheckEnabled ? 'Spell Checker enabled.' : 'Spell Checker paused.';
+		vscode.window.setStatusBarMessage(message, 3000);
+		if (this.autoCheckEnabled && vscode.window.activeTextEditor) {
+			void this.doSpellCheck(vscode.window.activeTextEditor.document);
+		}
+	}
+
+	private updateStatusBar(): void {
+		if (!this.statusBarItem) {
+			return;
+		}
+		const language = this.spellService.getLanguage() ?? this.settings.language;
+		const icon = this.autoCheckEnabled ? 'checklist' : 'circle-slash';
+		this.statusBarItem.text = `$(${icon}) Spell ${language}`;
+		this.statusBarItem.tooltip = this.autoCheckEnabled
+			? 'Spell Checker is enabled. Click to pause.'
+			: 'Spell Checker is paused. Click to enable.';
 	}
 }
