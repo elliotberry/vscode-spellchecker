@@ -1,9 +1,9 @@
 {
-    "name": "spellchecker",
-    "displayName": "SpellChecker",
-    "description": "Offline spell checker",
+    "name": "spellingdude",
+    "displayName": "spellingdude",
+    "description": "Offline spellingdude",
     "version": "1.4.1",
-    "publisher": "swyphcosmo",
+    "publisher": "z34zx",
     "engines": {
         "vscode": "^1.109.0"
     },
@@ -120,7 +120,8 @@
         "format": "prettier -w \"src/**/*.ts\"",
         "test": "npm run test:unit",
         "test:unit": "npm run build && mocha --ui bdd --color \"out/test/**/*.test.js\"",
-        "test:extension": "vscode-test"
+        "test:extension": "vscode-test",
+        "package": "npm run build && vsce package"
     },
     "devDependencies": {
         "@types/mocha": "^10.0.10",
@@ -137,7 +138,7 @@
         "vscode-test": "^1.6.1"
     },
     "dependencies": {
-        "hunspell-spellchecker": "^1.0.2",
+        "hunspell-spellchecker": "github:jamzy118/hunspell-spellchecker",
         "jsonminify": "^0.4.2"
     },
     "license": "MIT",
